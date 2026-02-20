@@ -61,6 +61,7 @@ const runtimes = new Map<number, ManagedRuntime>();
 const TOOL_CALL_PREFIX = "__TOOL_CALL__";
 const FINAL_PREFIX = "__FINAL__";
 const MAX_TOOL_PROTOCOL_ATTEMPTS = 3;
+const RAYCAST_ADVANCED_AI_LIMIT_MARKER = "advanced ai limit";
 
 function isChatPath(pathname: string): boolean {
   return (
@@ -235,6 +236,34 @@ function parseJsonLoose(raw: string): unknown {
     return JSON.parse(trimmed.slice(start, end + 1));
   }
 
+  return undefined;
+}
+
+function extractUpstreamErrorMessage(raw: string): string | undefined {
+  const trimmed = raw.trim();
+  if (!trimmed) return undefined;
+
+  try {
+    const parsed = parseJsonLoose(trimmed);
+    if (parsed && typeof parsed === "object") {
+      const data = parsed as Record<string, unknown>;
+      if (typeof data.error === "string" && data.error.trim()) {
+        return data.error.trim();
+      }
+      if (data.error && typeof data.error === "object") {
+        const nested = data.error as Record<string, unknown>;
+        if (typeof nested.message === "string" && nested.message.trim()) {
+          return nested.message.trim();
+        }
+      }
+    }
+  } catch {
+    // Ignore parse failures and fall back to marker matching below.
+  }
+
+  if (trimmed.toLowerCase().includes(RAYCAST_ADVANCED_AI_LIMIT_MARKER)) {
+    return trimmed;
+  }
   return undefined;
 }
 
@@ -580,7 +609,12 @@ async function resolveToolProtocolResult(
   selectedModel: AI.Model,
   tools: ChatToolDefinition[],
   toolChoice: ChatToolChoice | undefined,
-): Promise<{ toolCalls?: ChatToolCall[]; content?: string; error?: string }> {
+): Promise<{
+  toolCalls?: ChatToolCall[];
+  content?: string;
+  error?: string;
+  statusCode?: number;
+}> {
   const mustReturnToolCall =
     toolChoice === "required" ||
     Boolean(normalizeToolChoiceName(toolChoice)) ||
@@ -590,6 +624,10 @@ async function resolveToolProtocolResult(
 
   for (let attempt = 1; attempt <= MAX_TOOL_PROTOCOL_ATTEMPTS; attempt += 1) {
     const answer = await AI.ask(prompt, { model: selectedModel, creativity: "none" });
+    const upstreamError = extractUpstreamErrorMessage(answer);
+    if (upstreamError) {
+      return { error: upstreamError, statusCode: 500 };
+    }
     const parsed = parseToolCallsFromAnswer(answer, tools, toolChoice);
 
     if (parsed.toolCalls.length > 0) {
@@ -816,7 +854,9 @@ async function startService(
             toolChoice,
           );
           if (resolved.error) {
-            res.writeHead(422, { "Content-Type": "application/json" });
+            res.writeHead(resolved.statusCode || 422, {
+              "Content-Type": "application/json",
+            });
             res.end(JSON.stringify({ error: resolved.error }));
             return;
           }
@@ -878,19 +918,83 @@ async function startService(
         const stream = AI.ask(prompt, { model: selectedModel });
 
         if (payload.stream) {
-          res.writeHead(200, {
-            "Content-Type": "text/event-stream",
-            "Cache-Control": "no-cache",
-            Connection: "keep-alive",
-          });
+          let streamStarted = false;
+          let buffered = "";
+          let upstreamErrorFromStream: string | undefined;
+
+          const startSse = () => {
+            if (streamStarted) return;
+            streamStarted = true;
+            res.writeHead(200, {
+              "Content-Type": "text/event-stream",
+              "Cache-Control": "no-cache",
+              Connection: "keep-alive",
+            });
+          };
+
+          const writeChunk = (delta: string) => {
+            if (!delta) return;
+            res.write(
+              `data: ${JSON.stringify(openAIStreamChunk(requestModel, delta))}\n\n`,
+            );
+          };
 
           stream.on("data", (chunk) => {
-            res.write(
-              `data: ${JSON.stringify(openAIStreamChunk(requestModel, chunk.toString()))}\n\n`,
-            );
+            if (upstreamErrorFromStream) return;
+            const text = chunk.toString();
+
+            if (streamStarted) {
+              writeChunk(text);
+              return;
+            }
+
+            buffered += text;
+            const upstreamError = extractUpstreamErrorMessage(buffered);
+            if (upstreamError) {
+              upstreamErrorFromStream = upstreamError;
+              return;
+            }
+
+            const trimmed = buffered.trimStart();
+            const mayBeIncompleteJsonEnvelope =
+              trimmed.startsWith("{") && !trimmed.includes("}");
+            if (mayBeIncompleteJsonEnvelope) {
+              return;
+            }
+
+            startSse();
+            writeChunk(buffered);
+            buffered = "";
           });
 
-          await stream;
+          const finalAnswer = await stream;
+
+          if (upstreamErrorFromStream) {
+            res.writeHead(500, { "Content-Type": "application/json" });
+            res.end(JSON.stringify({ error: upstreamErrorFromStream }));
+            return;
+          }
+
+          if (!streamStarted) {
+            const finalAnswerText =
+              typeof finalAnswer === "string"
+                ? finalAnswer
+                : String(finalAnswer ?? "");
+            const finalText =
+              finalAnswerText.length >= buffered.length
+                ? finalAnswerText
+                : buffered;
+            const upstreamError = extractUpstreamErrorMessage(finalText);
+            if (upstreamError) {
+              res.writeHead(500, { "Content-Type": "application/json" });
+              res.end(JSON.stringify({ error: upstreamError }));
+              return;
+            }
+
+            startSse();
+            writeChunk(finalText);
+          }
+
           res.write(
             `data: ${JSON.stringify(openAIStreamEnd(requestModel))}\n\n`,
           );
@@ -900,6 +1004,12 @@ async function startService(
         }
 
         const answer = await stream;
+        const upstreamError = extractUpstreamErrorMessage(answer);
+        if (upstreamError) {
+          res.writeHead(500, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ error: upstreamError }));
+          return;
+        }
         res.writeHead(200, { "Content-Type": "application/json" });
         res.end(JSON.stringify(openAIResponse(requestModel, answer)));
       } catch (error) {

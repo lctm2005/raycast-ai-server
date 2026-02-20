@@ -37,6 +37,10 @@
 - `GET /health`
 - `POST /kill`
 
+## 测试文档
+
+- 自动化测试说明见：`TESTING.md`
+
 ## 快速验证
 
 ```bash

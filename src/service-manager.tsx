@@ -1,27 +1,22 @@
-import { Action, ActionPanel, AI, Form, Icon, List, Toast, showToast, useNavigation } from "@raycast/api";
+import {
+  Action,
+  ActionPanel,
+  AI,
+  Form,
+  Icon,
+  LaunchType,
+  List,
+  Toast,
+  launchCommand,
+  showToast,
+  useNavigation,
+} from "@raycast/api";
 import http from "http";
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { patchService, readServices, upsertService, writeServices } from "./storage";
-import type { ManagedService } from "./types";
+import type { ManagedService, ServerLaunchContext } from "./types";
 
-type ChatMessage = {
-  role: string;
-  content?: unknown;
-};
-
-type ChatCompletionsRequest = {
-  model?: string;
-  stream?: boolean;
-  messages?: ChatMessage[];
-};
-
-type RunningServer = {
-  serviceId: string;
-  server: http.Server;
-  modelValue: string;
-};
-
-const runningServers = new Map<number, RunningServer>();
+const ADMIN_PORT = 46321;
 
 function formatModelLabel(modelKey: string): string {
   return modelKey.replaceAll("_", " ");
@@ -57,178 +52,12 @@ function getModelOptions() {
   return Array.from(uniqueByValue.values()).sort((a, b) => a.key.localeCompare(b.key));
 }
 
-function isChatPath(pathname: string): boolean {
-  return pathname === "/v1/chat/completions" || pathname === "/chat/completions";
-}
-
-function isModelsPath(pathname: string): boolean {
-  return pathname === "/v1/models" || pathname === "/models";
-}
-
-function normalizeMessageContent(content: unknown): string {
-  if (typeof content === "string") return content;
-  if (Array.isArray(content)) {
-    const textParts = content
-      .map((item) => {
-        if (typeof item === "string") return item;
-        if (item && typeof item === "object" && "text" in item) {
-          const text = (item as { text?: unknown }).text;
-          return typeof text === "string" ? text : "";
-        }
-        return "";
-      })
-      .filter(Boolean);
-    return textParts.join("\n");
-  }
-  if (content && typeof content === "object" && "text" in content) {
-    const text = (content as { text?: unknown }).text;
-    if (typeof text === "string") return text;
-  }
-  return "";
-}
-
-function buildPrompt(messages: ChatMessage[]): string {
-  const lines = messages
-    .map((message) => {
-      const role = message.role || "user";
-      const text = normalizeMessageContent(message.content);
-      return `${role}: ${text}`.trim();
-    })
-    .filter(Boolean);
-
-  if (lines.length === 0) return "";
-  return `${lines.join("\n\n")}\n\nassistant:`;
-}
-
-function openAIResponse(model: string, content: string) {
-  return {
-    id: `chatcmpl-raycast-${Date.now()}`,
-    object: "chat.completion",
-    created: Math.floor(Date.now() / 1000),
-    model,
-    choices: [{ index: 0, message: { role: "assistant", content }, finish_reason: "stop" }],
-  };
-}
-
-function openAIStreamChunk(model: string, contentDelta: string) {
-  return {
-    id: `chatcmpl-raycast-${Date.now()}`,
-    object: "chat.completion.chunk",
-    created: Math.floor(Date.now() / 1000),
-    model,
-    choices: [{ index: 0, delta: { content: contentDelta }, finish_reason: null }],
-  };
-}
-
-function openAIStreamEnd(model: string) {
-  return {
-    id: `chatcmpl-raycast-${Date.now()}`,
-    object: "chat.completion.chunk",
-    created: Math.floor(Date.now() / 1000),
-    model,
-    choices: [{ index: 0, delta: {}, finish_reason: "stop" }],
-  };
-}
-
-function createServer(serviceId: string, modelKey: string, modelValue: string, port: number, onStopped: () => Promise<void>) {
-  const selectedModel = (AI.Model[modelKey as keyof typeof AI.Model] || modelValue) as AI.Model;
-
-  const server = http.createServer((req, res) => {
-    const method = req.method || "GET";
-    const pathname = req.url?.split("?")[0] || "/";
-
-    if (method === "GET" && pathname === "/health") {
-      res.writeHead(200, { "Content-Type": "application/json" });
-      res.end(JSON.stringify({ ok: true, model: modelValue, port, serviceId }));
-      return;
-    }
-
-    if (method === "POST" && pathname === "/kill") {
-      res.writeHead(200, { "Content-Type": "application/json" });
-      res.end(JSON.stringify({ message: `Server on port ${port} is shutting down` }));
-      server.close();
-      return;
-    }
-
-    if (method === "GET" && isModelsPath(pathname)) {
-      res.writeHead(200, { "Content-Type": "application/json" });
-      res.end(
-        JSON.stringify({
-          object: "list",
-          data: [{ id: modelValue, object: "model", owned_by: "raycast" }],
-        }),
-      );
-      return;
-    }
-
-    if (method !== "POST" || !isChatPath(pathname)) {
-      res.writeHead(404, { "Content-Type": "application/json" });
-      res.end(JSON.stringify({ error: "Endpoint not found" }));
-      return;
-    }
-
-    let body = "";
-    req.on("data", (chunk) => {
-      body += chunk;
-    });
-
-    req.on("end", async () => {
-      try {
-        const payload = JSON.parse(body || "{}") as ChatCompletionsRequest;
-        if (!Array.isArray(payload.messages) || payload.messages.length === 0) {
-          res.writeHead(400, { "Content-Type": "application/json" });
-          res.end(JSON.stringify({ error: "messages is required" }));
-          return;
-        }
-
-        const requestModel = payload.model || modelValue;
-        const prompt = buildPrompt(payload.messages);
-        if (!prompt.trim()) {
-          res.writeHead(400, { "Content-Type": "application/json" });
-          res.end(JSON.stringify({ error: "Could not parse messages content" }));
-          return;
-        }
-
-        const stream = AI.ask(prompt, { model: selectedModel });
-
-        if (payload.stream) {
-          res.writeHead(200, {
-            "Content-Type": "text/event-stream",
-            "Cache-Control": "no-cache",
-            Connection: "keep-alive",
-          });
-
-          stream.on("data", (chunk) => {
-            res.write(`data: ${JSON.stringify(openAIStreamChunk(requestModel, chunk.toString()))}\n\n`);
-          });
-
-          await stream;
-          res.write(`data: ${JSON.stringify(openAIStreamEnd(requestModel))}\n\n`);
-          res.write("data: [DONE]\n\n");
-          res.end();
-          return;
-        }
-
-        const answer = await stream;
-        res.writeHead(200, { "Content-Type": "application/json" });
-        res.end(JSON.stringify(openAIResponse(requestModel, answer)));
-      } catch (error) {
-        const message = error instanceof Error ? error.message : String(error);
-        res.writeHead(500, { "Content-Type": "application/json" });
-        res.end(JSON.stringify({ error: message }));
-      }
-    });
-  });
-
-  server.on("close", async () => {
-    runningServers.delete(port);
-    await onStopped();
-  });
-
-  return server;
-}
-
-async function requestJSON(method: "GET" | "POST", port: number, path: string): Promise<{ statusCode: number; body: any }> {
+async function requestJSON(
+  method: "GET" | "POST",
+  port: number,
+  path: string,
+  payload?: unknown,
+): Promise<{ statusCode: number; body: any }> {
   return new Promise((resolve, reject) => {
     const req = http.request(
       {
@@ -246,7 +75,8 @@ async function requestJSON(method: "GET" | "POST", port: number, path: string): 
         res.on("end", () => {
           const statusCode = res.statusCode || 500;
           try {
-            resolve({ statusCode, body: raw ? JSON.parse(raw) : {} });
+            const body = raw ? JSON.parse(raw) : {};
+            resolve({ statusCode, body });
           } catch {
             resolve({ statusCode, body: { message: raw } });
           }
@@ -254,36 +84,66 @@ async function requestJSON(method: "GET" | "POST", port: number, path: string): 
       },
     );
     req.on("error", reject);
+    if (payload !== undefined) {
+      req.write(JSON.stringify(payload));
+    }
     req.end();
   });
 }
 
-async function isServerHealthy(port: number): Promise<boolean> {
+async function getHealth(port: number): Promise<{ ok: boolean; serviceId?: string }> {
   try {
     const response = await requestJSON("GET", port, "/health");
-    return response.statusCode >= 200 && response.statusCode < 300;
+    if (response.statusCode < 200 || response.statusCode >= 300) return { ok: false };
+    return {
+      ok: true,
+      serviceId:
+        typeof response.body?.serviceId === "string"
+          ? (response.body.serviceId as string)
+          : undefined,
+    };
   } catch {
-    return false;
+    return { ok: false };
   }
 }
 
-async function stopServer(port: number): Promise<string> {
-  const inMemory = runningServers.get(port);
-  if (inMemory) {
-    await new Promise<void>((resolve, reject) => {
-      inMemory.server.close((err) => {
-        if (err) reject(err);
-        else resolve();
-      });
-    });
-    return `Server on port ${port} is shutting down`;
+async function ensureDaemon(): Promise<void> {
+  try {
+    const ok = await requestJSON("GET", ADMIN_PORT, "/admin/health");
+    if (ok.statusCode >= 200 && ok.statusCode < 300) return;
+  } catch {
+    // daemon not up
   }
 
-  const response = await requestJSON("POST", port, "/kill");
-  if (response.statusCode < 200 || response.statusCode >= 300) {
-    throw new Error(response.body.error || `Failed with status ${response.statusCode}`);
+  await launchCommand({ name: "run-openai-server", type: LaunchType.UserInitiated });
+
+  for (let i = 0; i < 10; i++) {
+    await new Promise((r) => setTimeout(r, 150));
+    try {
+      const res = await requestJSON("GET", ADMIN_PORT, "/admin/health");
+      if (res.statusCode >= 200 && res.statusCode < 300) return;
+    } catch {
+      // retry
+    }
   }
-  return response.body.message || "Server stopped";
+
+  throw new Error("Daemon did not become ready");
+}
+
+async function daemonStart(context: ServerLaunchContext): Promise<void> {
+  await ensureDaemon();
+  const response = await requestJSON("POST", ADMIN_PORT, "/admin/start", context);
+  if (response.statusCode < 200 || response.statusCode >= 300) {
+    throw new Error(response.body.error || "Failed to start service in daemon");
+  }
+}
+
+async function daemonStop(port: number): Promise<void> {
+  await ensureDaemon();
+  const response = await requestJSON("POST", ADMIN_PORT, "/admin/stop", { port });
+  if (response.statusCode < 200 || response.statusCode >= 300) {
+    throw new Error(response.body.error || "Failed to stop service in daemon");
+  }
 }
 
 function StartServiceForm(props: {
@@ -292,6 +152,7 @@ function StartServiceForm(props: {
   const { pop } = useNavigation();
   const modelOptions = useMemo(() => getModelOptions(), []);
   const [isSubmitting, setIsSubmitting] = useState(false);
+
   const defaultModel = modelOptions.find((item) => item.key === "Perplexity_Sonar_Pro") || modelOptions[0];
 
   return (
@@ -304,7 +165,11 @@ function StartServiceForm(props: {
             onSubmit={async (values: { modelKey: string; port: string }) => {
               const port = Number(values.port.trim());
               if (!Number.isInteger(port) || port < 1 || port > 65535) {
-                await showToast({ style: Toast.Style.Failure, title: "Invalid Port", message: "Port must be an integer between 1 and 65535" });
+                await showToast({
+                  style: Toast.Style.Failure,
+                  title: "Invalid Port",
+                  message: "Port must be an integer between 1 and 65535",
+                });
                 return;
               }
 
@@ -333,7 +198,7 @@ function StartServiceForm(props: {
         ))}
       </Form.Dropdown>
       <Form.TextField id="port" title="Port" defaultValue="1235" placeholder="1235" />
-      <Form.Description text="启动后将暴露 /v1/chat/completions 和 /chat/completions。" />
+      <Form.Description text="启动后将暴露 /v1/chat/completions 以及 /chat/completions。" />
     </Form>
   );
 }
@@ -349,9 +214,14 @@ export default function Command() {
 
     const next = await Promise.all(
       existing.map(async (service) => {
-        const healthy = await isServerHealthy(service.port);
-        if (healthy) return { ...service, status: "running" as const, lastError: undefined };
-        if (service.status === "starting" || service.status === "running") return { ...service, status: "stopped" as const };
+        const health = await getHealth(service.port);
+        if (health.ok) {
+          const id = health.serviceId && health.serviceId.includes(":") ? health.serviceId : service.id;
+          return { ...service, id, status: "running" as const, lastError: undefined };
+        }
+        if (service.status === "starting" || service.status === "running") {
+          return { ...service, status: "stopped" as const };
+        }
         return service;
       }),
     );
@@ -369,20 +239,18 @@ export default function Command() {
   const startService = useCallback(
     async (modelKey: string, modelValue: string, port: number) => {
       const serviceId = getServiceId(modelValue, port);
-      const isRunningOnPort = await isServerHealthy(port);
-      const existing = dedupeServices(await readServices());
-      const existingSame = existing.find((s) => s.id === serviceId);
+      const health = await getHealth(port);
 
-      if (isRunningOnPort && existingSame?.status === "running") {
+      if (health.ok && health.serviceId === serviceId) {
         await showToast({ style: Toast.Style.Failure, title: "Already Running", message: `${modelKey} on :${port}` });
         return;
       }
 
-      if (isRunningOnPort && !runningServers.has(port)) {
+      if (health.ok && health.serviceId !== serviceId) {
         await showToast({
           style: Toast.Style.Failure,
           title: "Port Already In Use",
-          message: `Another process is using port ${port}`,
+          message: `Port ${port} is occupied by another service`,
         });
         return;
       }
@@ -397,19 +265,10 @@ export default function Command() {
       };
       await upsertService(record);
 
-      const server = createServer(serviceId, modelKey, modelValue, port, async () => {
-        await patchService(serviceId, { status: "stopped" });
-      });
-
       try {
-        await new Promise<void>((resolve, reject) => {
-          server.once("error", reject);
-          server.listen(port, () => resolve());
-        });
-
-        runningServers.set(port, { serviceId, server, modelValue });
-        await patchService(serviceId, { status: "running", startedAt: Date.now(), lastError: undefined });
-        await showToast({ style: Toast.Style.Success, title: "Service Started", message: `${modelKey} on :${port}` });
+        await daemonStart({ serviceId, modelKey, modelValue, port });
+        await patchService(serviceId, { status: "running", lastError: undefined, startedAt: Date.now() });
+        await showToast({ style: Toast.Style.Success, title: "Server Launching", message: `${modelKey} on :${port}` });
       } catch (error) {
         const message = error instanceof Error ? error.message : String(error);
         await patchService(serviceId, { status: "error", lastError: message });
@@ -480,9 +339,9 @@ export default function Command() {
                     icon={Icon.Stop}
                     onAction={async () => {
                       try {
-                        const message = await stopServer(service.port);
+                        await daemonStop(service.port);
                         await patchService(service.id, { status: "stopped", lastError: undefined });
-                        await showToast({ style: Toast.Style.Success, title: "Service Stopped", message });
+                        await showToast({ style: Toast.Style.Success, title: "Service Stopped" });
                       } catch (error) {
                         const message = error instanceof Error ? error.message : String(error);
                         await patchService(service.id, { status: "error", lastError: message });
@@ -492,18 +351,10 @@ export default function Command() {
                     }}
                   />
                 ) : (
-                  <Action
-                    title="Start Service"
-                    icon={Icon.Play}
-                    onAction={() => startService(service.modelKey, service.modelValue, service.port)}
-                  />
+                  <Action title="Start Service" icon={Icon.Play} onAction={() => startService(service.modelKey, service.modelValue, service.port)} />
                 )}
 
-                <Action
-                  title="Refresh"
-                  icon={Icon.ArrowClockwise}
-                  onAction={refresh}
-                />
+                <Action title="Refresh" icon={Icon.ArrowClockwise} onAction={refresh} />
               </ActionPanel>
             }
           />

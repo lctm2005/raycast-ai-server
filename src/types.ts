@@ -9,3 +9,10 @@ export interface ManagedService {
   startedAt: number;
   lastError?: string;
 }
+
+export interface ServerLaunchContext {
+  serviceId: string;
+  modelKey: string;
+  modelValue: string;
+  port: number;
+}

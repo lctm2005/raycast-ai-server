@@ -12,6 +12,12 @@
       "title": "Manage AI Server",
       "description": "选择模型与端口，启动/停止本地 OpenAI 服务",
       "mode": "view"
+    },
+    {
+      "name": "run-openai-server",
+      "title": "Run OpenAI Server (Internal)",
+      "description": "内部常驻命令，请勿手动执行",
+      "mode": "no-view"
     }
   ],
   "dependencies": {
@@ -31,6 +37,7 @@
     "dev": "ray develop",
     "fix-lint": "ray lint --fix",
     "lint": "ray lint",
+    "test:smoke": "bash ./scripts/smoke-multi-service.sh",
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "prepublishOnly": "echo \"\\n\\nIt seems like you are trying to publish the Raycast extension to npm.\\n\\nIf you did intend to publish it to npm, remove the \\`prepublishOnly\\` script and rerun \\`npm publish\\` again.\\nIf you wanted to publish it to the Raycast Store instead, use \\`npm run publish\\` instead.\\n\\n\" && exit 1",
     "publish": "npx @raycast/api@latest publish"
